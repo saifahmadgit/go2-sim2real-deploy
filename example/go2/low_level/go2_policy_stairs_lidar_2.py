@@ -1,19 +1,23 @@
 """
-go2_deploy_stairs_lidar.py
-===========================
-Go2 stair climbing deployment with LIDAR terrain scan.
+go2_deploy_stairs_info.py
+==========================
+Go2 stair climbing deployment with 4-value stair info.
 
-Based on the non-LIDAR deployment script, with added:
-  - LIDAR point cloud subscription
-  - Edge detection (reliable 0-27cm range)
-  - Geometric stair grid construction (5×3 = 15 values)
-  - Appended to observation vector: 49 proprio + 15 LIDAR = 64
+Much simpler than the 5×3 LIDAR grid version. The policy receives:
+  [0] edge_distance : from LIDAR edge detector (0..0.27m)
+  [1] stair_height  : user-provided constant (meters)
+  [2] stair_depth   : user-provided constant (meters)
+  [3] direction     : auto from LIDAR edge sign (+1/-1/0)
 
-The LIDAR scan is computed every policy step from the latest
-point cloud. If no cloud available, outputs zeros (matches
-training's 5% full-blackout noise).
+Usage:
+  1. Set STAIR_HEIGHT and STAIR_DEPTH at the top of this file
+  2. python go2_deploy_stairs_info.py
 
-CHECKPOINT: Must be from train_stair4_lidar.py (64-dim actor obs).
+The LIDAR edge detector scans the near-field (0-27cm) for height
+changes. If found, reports distance and direction. If not found,
+reports 0.27m (sentinel) and direction 0.
+
+CHECKPOINT: Must be from train_stair5_info.py (53-dim actor obs).
 """
 
 import math as pymath
@@ -21,17 +25,22 @@ import os
 import sys
 import time
 
+import numpy as np
 import torch
-import yaml
 
 # ============================================================
 # MODE
 # ============================================================
 MODE = "robot_run"  # "dummy" | "robot_print" | "robot_run"
 
-DUMMY_YAML_PATH = "dummy_state.yaml"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-CKPT_PATH = os.path.join(SCRIPT_DIR, "model_47000.pt")  # ← LIDAR checkpoint
+CKPT_PATH = os.path.join(SCRIPT_DIR, "stairs_lidar2_40500.pt")
+
+# ============================================================
+# STAIR DIMENSIONS — SET THESE TO MATCH YOUR STAIRCASE
+# ============================================================
+STAIR_HEIGHT = 0.15  # meters (riser height, always positive)
+STAIR_DEPTH = 0.03  # meters (tread depth, always positive)
 
 # ============================================================
 # VELOCITY COMMANDS
@@ -65,7 +74,7 @@ PLS_KP_ACTION_SCALE = 20.0
 PLS_KP_RANGE = [10.0, 70.0]
 
 KP_FACTOR = 1.0
-KD_FACTOR = 0.6
+KD_FACTOR = 1.5
 
 POLICY_KP_FALLBACK = 40.0
 POLICY_KD_FALLBACK = 2.0
@@ -76,21 +85,13 @@ SIMULATE_1STEP_ACTION_LATENCY = False
 TRANSITION_SECONDS = 2.0
 
 # ============================================================
-# STAIR / LIDAR CONFIG
+# EDGE DETECTION CONFIG
 # ============================================================
-STAIR_DEPTH = 0.25  # meters — one tread depth
-STAIR_HEIGHT = 0.15  # meters — one riser height
-
-# LIDAR geometry (set to 0 since edge detector uses LIDAR frame)
-LIDAR_X_FROM_BASE = 0.0
-LIDAR_Z_FROM_BASE = 0.0
-
-# Edge detection
+EDGE_MAX_RANGE = 0.27  # reliable LIDAR range
 EDGE_Z_THRESHOLD = 0.04  # 4cm z-change = edge
-EDGE_SEARCH_MAX_X = 0.27  # reliable LIDAR range
 PROFILE_BIN_SIZE = 0.01  # 1cm profile resolution
-PROFILE_X_MIN = -0.10
-PROFILE_X_MAX = 0.60
+PROFILE_X_MIN = -0.05
+PROFILE_X_MAX = 0.30
 Y_CAPTURE_HALF = 0.20
 MIN_PTS_PER_BIN = 3
 GROUND_X_MAX = 0.08  # near-field ground reference
@@ -100,15 +101,13 @@ LIDAR_CALIB_FILE = "stair_scan_calib.npz"
 NOMINAL_STANDING_HEIGHT = 0.35
 LIDAR_CALIB_DURATION = 5.0
 
-# Grid (MUST match training)
-LIDAR_X_POINTS = [0.0, 0.15, 0.30, 0.50, 0.80]
-LIDAR_Y_POINTS = [-0.15, 0.0, 0.15]
-LIDAR_NX = len(LIDAR_X_POINTS)
-LIDAR_NY = len(LIDAR_Y_POINTS)
-NUM_LIDAR_CELLS = LIDAR_NX * LIDAR_NY  # 15
-
-HEIGHT_CLIP = 1.0
-HEIGHT_SCALE = 1.0
+# ============================================================
+# OBSERVATION SCALING (must match training)
+# ============================================================
+EDGE_DIST_SCALE = 3.7  # 1/0.27
+HEIGHT_SCALE = 5.0  # 1/0.20
+DEPTH_SCALE = 3.3  # 1/0.30
+DIRECTION_SCALE = 1.0
 
 # ============================================================
 # OBSERVATION DIMENSIONS
@@ -117,9 +116,9 @@ NUM_POS_ACTIONS = 12
 NUM_STIFFNESS_ACTIONS = 4 if PLS_ENABLE else 0
 NUM_ACT = NUM_POS_ACTIONS + NUM_STIFFNESS_ACTIONS  # 16
 
-# 49 proprio + 15 LIDAR = 64
+NUM_STAIR_INFO = 4
 NUM_PROPRIO = 3 + 3 + 3 + 12 + 12 + NUM_ACT  # 49
-NUM_OBS = NUM_PROPRIO + NUM_LIDAR_CELLS  # 64
+NUM_OBS = NUM_PROPRIO + NUM_STAIR_INFO  # 53
 
 OBS_SCALES = {"lin_vel": 2.0, "ang_vel": 0.25, "dof_pos": 1.0, "dof_vel": 0.05}
 
@@ -150,7 +149,6 @@ STAND_DOF_POS = DEFAULT_DOF_POS.clone()
 # ============================================================
 # LIDAR: Point Cloud Decode
 # ============================================================
-import numpy as np
 
 _DTYPES = {5: np.int32, 6: np.uint32, 7: np.float32, 8: np.float64}
 
@@ -181,54 +179,37 @@ def decode_xyz(msg):
 
 
 # ============================================================
-# LIDAR: Gravity Projection
+# LIDAR: Edge Detector
 # ============================================================
 
 
-def gravity_z_row(roll, pitch):
-    """Third row of body-to-world rotation. Projects body z onto gravity axis."""
-    cr, sr = pymath.cos(roll), pymath.sin(roll)
-    cp, sp = pymath.cos(pitch), pymath.sin(pitch)
-    return np.array([-sp, cp * sr, cp * cr], dtype=np.float64)
-
-
-# ============================================================
-# LIDAR: Stair Scanner
-# ============================================================
-
-
-class StairScanner:
+class EdgeDetector:
     """
-    Computes 15-value terrain grid from LIDAR point cloud.
+    Detects nearest stair edge from LIDAR point cloud.
 
-    Algorithm:
-      1. Near-field edge detection (0-27cm)
-      2. Geometric stair construction from edge + known dimensions
-      3. Pitch-corrected coordinate transform
+    Returns:
+      edge_distance : 0..0.27m (or 0.27 if no edge)
+      direction     : +1 ascending, -1 descending, 0 no edge
     """
 
     def __init__(self):
         self.ground_z_calib = -NOMINAL_STANDING_HEIGHT
         self.calibrated = False
 
-        # Profile bins
         self.profile_edges = np.arange(
             PROFILE_X_MIN, PROFILE_X_MAX + PROFILE_BIN_SIZE, PROFILE_BIN_SIZE
         )
         self.profile_centers = (self.profile_edges[:-1] + self.profile_edges[1:]) / 2
         self.n_bins = len(self.profile_centers)
 
-    def compute_scan(self, pts_lidar, roll=0.0, pitch=0.0):
+    def detect(self, pts_lidar, roll=0.0, pitch=0.0):
         """
-        Returns (15,) float32 array matching training grid exactly.
+        Returns (edge_distance, direction) from latest LIDAR cloud.
         """
-        ny = LIDAR_NY
-        scan = np.full(NUM_LIDAR_CELLS, self.ground_z_calib, dtype=np.float64)
-
         if len(pts_lidar) == 0:
-            return self._clip(scan)
+            return EDGE_MAX_RANGE, 0.0
 
-        # Transform LIDAR → body
+        # Transform LIDAR → body frame
         bx = -pts_lidar[:, 0]
         by = pts_lidar[:, 1]
         bz = -pts_lidar[:, 2]
@@ -237,13 +218,15 @@ class StairScanner:
         bx, by, bz = bx[valid], by[valid], bz[valid]
 
         if len(bx) == 0:
-            return self._clip(scan)
+            return EDGE_MAX_RANGE, 0.0
 
-        # Gravity projection
-        r2 = gravity_z_row(roll, pitch)
+        # Gravity projection for pitch correction
+        cr, sr = pymath.cos(roll), pymath.sin(roll)
+        cp, sp = pymath.cos(pitch), pymath.sin(pitch)
+        r2 = np.array([-sp, cp * sr, cp * cr], dtype=np.float64)
         z_grav = r2[0] * bx + r2[1] * by + r2[2] * bz
 
-        # Measure ground z (near-field)
+        # Measure ground z (near-field reference)
         y_ok = np.abs(by) <= Y_CAPTURE_HALF
         gnd_mask = y_ok & (bx >= -0.05) & (bx <= GROUND_X_MAX)
         if np.sum(gnd_mask) >= 5:
@@ -251,7 +234,7 @@ class StairScanner:
         else:
             ground_z = self.ground_z_calib
 
-        # Build 1D profile
+        # Build 1D forward profile
         filt = y_ok
         bx_f, zg_f = bx[filt], z_grav[filt]
         profile_z = np.full(self.n_bins, np.nan)
@@ -261,54 +244,22 @@ class StairScanner:
             if np.sum(mask) >= MIN_PTS_PER_BIN:
                 profile_z[b] = np.median(zg_f[mask])
 
-        # Detect edge
-        edge_x_lidar = None
-        edge_dz = None
+        # Find first significant height change
         valid_z = ~np.isnan(profile_z)
         for b in range(self.n_bins):
             if not valid_z[b]:
                 continue
-            if self.profile_centers[b] > EDGE_SEARCH_MAX_X:
+            if self.profile_centers[b] > EDGE_MAX_RANGE:
                 break
+            if self.profile_centers[b] < 0.0:
+                continue
             dz = profile_z[b] - ground_z
             if abs(dz) > EDGE_Z_THRESHOLD:
-                edge_x_lidar = self.profile_centers[b]
-                edge_dz = dz
-                break
+                edge_distance = float(self.profile_centers[b])
+                direction = 1.0 if dz > 0 else -1.0
+                return edge_distance, direction
 
-        # Construct grid
-        if edge_x_lidar is not None:
-            cp = pymath.cos(pitch)
-            sp = pymath.sin(pitch)
-            lidar_horiz = LIDAR_X_FROM_BASE * cp - LIDAR_Z_FROM_BASE * sp
-            edge_x_base = edge_x_lidar * cp + lidar_horiz
-            ascending = edge_dz > 0
-            tread_x = STAIR_DEPTH
-
-            for xi in range(LIDAR_NX):
-                x = LIDAR_X_POINTS[xi]
-                if x < edge_x_base:
-                    h = ground_z
-                else:
-                    dx = x - edge_x_base
-                    step_n = 1 + int(dx / tread_x)
-                    if ascending:
-                        h = ground_z + step_n * STAIR_HEIGHT
-                    else:
-                        h = ground_z + step_n * STAIR_HEIGHT
-
-                for yi in range(ny):
-                    scan[xi * ny + yi] = h
-        else:
-            # Flat terrain
-            scan[:] = ground_z
-
-        return self._clip(scan)
-
-    def _clip(self, scan):
-        return np.clip(scan * HEIGHT_SCALE, -HEIGHT_CLIP, HEIGHT_CLIP).astype(
-            np.float32
-        )
+        return EDGE_MAX_RANGE, 0.0
 
     def calibrate_from_flat(self, ground_z_list):
         if len(ground_z_list) < 5:
@@ -318,7 +269,7 @@ class StairScanner:
         print(f"  [LIDAR] Calibrated ground_z = {self.ground_z_calib:+.4f}m")
         try:
             np.savez(LIDAR_CALIB_FILE, ground_z=self.ground_z_calib)
-        except:
+        except Exception:
             pass
         return True
 
@@ -331,7 +282,7 @@ class StairScanner:
             self.calibrated = True
             print(f"  [LIDAR] Loaded calib: ground_z={self.ground_z_calib:+.4f}")
             return True
-        except:
+        except Exception:
             return False
 
 
@@ -349,37 +300,59 @@ def _on_lidar_cloud(msg):
     _lidar_cloud_count += 1
 
 
-# Scanner instance (created later after DDS init)
-_stair_scanner = None
-_lidar_scan_cache = np.zeros(NUM_LIDAR_CELLS, dtype=np.float32)
+_edge_detector = None
+_cached_edge_distance = EDGE_MAX_RANGE
+_cached_direction = 0.0
 _lidar_last_cloud_count = 0
 
 
-def update_lidar_scan(roll, pitch):
+def update_edge_detection(roll, pitch):
     """
-    Update the cached 15-value LIDAR scan from latest cloud.
-    Call this once per policy step.
-    Returns (15,) float32 numpy array.
+    Update cached edge detection from latest LIDAR cloud.
+    Returns (edge_distance, direction).
     """
-    global _lidar_scan_cache, _lidar_last_cloud_count
+    global _cached_edge_distance, _cached_direction, _lidar_last_cloud_count
 
-    if _stair_scanner is None or _lidar_cloud_msg is None:
-        return _lidar_scan_cache
+    if _edge_detector is None or _lidar_cloud_msg is None:
+        return _cached_edge_distance, _cached_direction
 
     if _lidar_cloud_count == _lidar_last_cloud_count:
-        # No new cloud — return cached
-        return _lidar_scan_cache
+        return _cached_edge_distance, _cached_direction
 
     _lidar_last_cloud_count = _lidar_cloud_count
 
     try:
         xyz = decode_xyz(_lidar_cloud_msg)
         if len(xyz) > 100:
-            _lidar_scan_cache = _stair_scanner.compute_scan(xyz, roll, pitch)
+            _cached_edge_distance, _cached_direction = _edge_detector.detect(
+                xyz, roll, pitch
+            )
     except Exception:
-        pass  # Keep cached value on decode error
+        pass
 
-    return _lidar_scan_cache
+    return _cached_edge_distance, _cached_direction
+
+
+# ============================================================
+# Build stair info observation (4 scaled values)
+# ============================================================
+
+
+def build_stair_info(edge_distance, stair_height, stair_depth, direction):
+    """
+    Build 4-value stair info tensor matching training exactly.
+
+    Returns: (4,) float32 tensor [edge_dist*scale, height*scale, depth*scale, direction*scale]
+    """
+    return torch.tensor(
+        [
+            edge_distance * EDGE_DIST_SCALE,
+            stair_height * HEIGHT_SCALE,
+            stair_depth * DEPTH_SCALE,
+            direction * DIRECTION_SCALE,
+        ],
+        dtype=torch.float32,
+    )
 
 
 # ============================================================
@@ -390,12 +363,10 @@ def update_lidar_scan(roll, pitch):
 def compute_pls_kp_kd(stiffness_actions_4):
     kp_per_leg = PLS_KP_DEFAULT + stiffness_actions_4 * PLS_KP_ACTION_SCALE
     kp_per_leg = torch.clamp(kp_per_leg, PLS_KP_RANGE[0], PLS_KP_RANGE[1])
-
     kp_12 = torch.zeros(12, dtype=torch.float32)
     for leg_idx in range(4):
         for joint_idx in LEG_JOINT_MAP[leg_idx]:
             kp_12[joint_idx] = kp_per_leg[leg_idx]
-
     kd_12 = 0.2 * torch.sqrt(kp_12)
     kp_12 = kp_12 * KP_FACTOR
     kd_12 = kd_12 * KD_FACTOR
@@ -448,37 +419,41 @@ def pitch_roll_from_quat(q_wxyz):
     return float(pitch_rad) * 57.2958, float(roll_rad) * 57.2958
 
 
+def get_imu_rp_from_raw(raw):
+    quat = raw["imu"]["quat_wxyz"]
+    w, x, y, z = quat
+    roll = pymath.atan2(2.0 * (w * x + y * z), 1.0 - 2.0 * (x * x + y * y))
+    pitch = pymath.asin(max(-1.0, min(1.0, 2.0 * (w * y - z * x))))
+    return roll, pitch
+
+
 # ============================================================
-# Build observation vector (64 dims = 49 proprio + 15 LIDAR)
+# Build observation vector (53 dims = 49 proprio + 4 stair info)
 # ============================================================
 
 
-def build_obs(raw, command_3, last_action, lidar_scan_15):
+def build_obs(raw, command_3, last_action, stair_info_4):
     """
-    Build actor observation matching train_stair4_lidar.py exactly.
+    Build actor observation matching train_stair5_info.py exactly.
 
-    Layout (64 dims):
+    Layout (53 dims):
       [0:3]   angular velocity * 0.25
       [3:6]   projected gravity
       [6:9]   commands * [2.0, 2.0, 0.25]
       [9:21]  (joint_pos - default) * 1.0
       [21:33] joint_vel * 0.05
-      [33:49] last_actions (16: 12 pos + 4 stiffness)
-      [49:64] LIDAR terrain scan (15 values)     ← NEW
+      [33:49] last_actions (16)
+      [49:53] stair_info (4 scaled values)
     """
     gyro = torch.tensor(raw["imu"]["gyro_rad_s"], dtype=torch.float32)
     proj_g = projected_gravity_from_quat_body_in_world(raw["imu"]["quat_wxyz"])
-
     q = torch.tensor([m["q_rad"] for m in raw["motors"]], dtype=torch.float32)
     dq = torch.tensor([m["dq_rad_s"] for m in raw["motors"]], dtype=torch.float32)
-
     cmd = torch.tensor(command_3, dtype=torch.float32)
     cmd_scale = torch.tensor(
         [OBS_SCALES["lin_vel"], OBS_SCALES["lin_vel"], OBS_SCALES["ang_vel"]],
         dtype=torch.float32,
     )
-
-    lidar_tensor = torch.tensor(lidar_scan_15, dtype=torch.float32)
 
     obs = torch.cat(
         [
@@ -488,7 +463,7 @@ def build_obs(raw, command_3, last_action, lidar_scan_15):
             (q - DEFAULT_DOF_POS) * OBS_SCALES["dof_pos"],  # 12
             dq * OBS_SCALES["dof_vel"],  # 12
             last_action,  # 16
-            lidar_tensor,  # 15 ← NEW
+            stair_info_4,  # 4
         ],
         dim=0,
     )
@@ -537,54 +512,12 @@ def load_policy(ckpt_path):
 # ============================================================
 
 
-def debug_print_all(
-    raw,
-    command_3,
-    last_action,
-    obs,
-    action_raw,
-    action_clipped,
-    target_q_12,
-    lidar_scan_15=None,
-    kp_12=None,
-    kd_12=None,
-    note="",
-):
-    quat = raw["imu"]["quat_wxyz"]
-    proj_g = projected_gravity_from_quat_body_in_world(quat).tolist()
-    pitch_deg, roll_deg = pitch_roll_from_quat(quat)
-
-    if note:
-        print(f"\n==================== {note} ====================")
-
-    print(f"\nIMU: pitch={pitch_deg:+.1f}° roll={roll_deg:+.1f}°")
-    print(f"Commands: {command_3}")
-
-    print("\nTarget q (rad):")
-    for i, name in enumerate(JOINT_NAMES):
-        print(f"  {i:02d} {name:>8s} : {float(target_q_12[i]):.4f}")
-
-    if kp_12 is not None:
-        print("\nPer-leg Kp (after factors):")
-        for i, leg in enumerate(LEG_NAMES):
-            j = LEG_JOINT_MAP[i][0]
-            print(f"  {leg}: Kp={float(kp_12[j]):.1f}  Kd={float(kd_12[j]):.3f}")
-
-    if lidar_scan_15 is not None:
-        print("\nLIDAR scan (15 values):")
-        for xi in range(LIDAR_NX):
-            vals = [lidar_scan_15[xi * LIDAR_NY + yi] for yi in range(LIDAR_NY)]
-            print(
-                f"  x={LIDAR_X_POINTS[xi]:.2f}: "
-                f"[{', '.join(f'{v:+.3f}' for v in vals)}]"
-            )
-
-
 def print_status_line(
     step,
     command_3,
     target_q_12,
-    lidar_scan_15=None,
+    edge_dist,
+    direction,
     kp_12=None,
     pitch_deg=0.0,
     roll_deg=0.0,
@@ -595,16 +528,13 @@ def print_status_line(
         kps = [float(kp_12[LEG_JOINT_MAP[i][0]]) for i in range(4)]
         kp_str = f" Kp=[{kps[0]:.0f},{kps[1]:.0f},{kps[2]:.0f},{kps[3]:.0f}]"
 
-    lidar_str = ""
-    if lidar_scan_15 is not None:
-        # Show forward profile (y=0 column)
-        fwd = [float(lidar_scan_15[xi * LIDAR_NY + 1]) for xi in range(LIDAR_NX)]
-        lidar_str = f" scan=[{','.join(f'{v:+.2f}' for v in fwd)}]"
+    dir_sym = {1.0: "↑", -1.0: "↓"}.get(direction, "—")
 
     print(
         f"\r  step={step:06d}  cmd=[{vx:+.2f},{vy:+.2f},{wz:+.2f}]  "
         f"pitch={pitch_deg:+5.1f}° roll={roll_deg:+5.1f}°"
-        f"{kp_str}{lidar_str}  ",
+        f"  edge={edge_dist:.2f}m {dir_sym}"
+        f"{kp_str}  ",
         end="",
         flush=True,
     )
@@ -701,7 +631,7 @@ def handle_key(key):
 
 
 def print_controls():
-    print("\n============ STAIR CLIMBING + LIDAR ============")
+    print("\n============ STAIR CLIMBING (4-value info) ============")
     print(f"  W : forward (vx={FORWARD_VX:.2f})")
     print(f"  S : backward (vx={-BACKWARD_VX:.2f})")
     print("  D : right   A : left")
@@ -709,9 +639,11 @@ def print_controls():
     print("  SPACE : zero velocity")
     print("  E : return to stand")
     print("  X : quit")
-    print(f"\n  LIDAR: {NUM_LIDAR_CELLS} terrain values appended to obs")
-    print(f"  Stair: depth={STAIR_DEPTH}m height={STAIR_HEIGHT}m")
-    print("=================================================\n")
+    print(
+        f"\n  Stair: height={STAIR_HEIGHT * 100:.1f}cm  depth={STAIR_DEPTH * 100:.1f}cm"
+    )
+    print(f"  Edge detection: 0..{EDGE_MAX_RANGE * 100:.0f}cm range")
+    print("=======================================================\n")
 
 
 def slew_limit(prev_q, new_q, max_step_rad):
@@ -720,23 +652,20 @@ def slew_limit(prev_q, new_q, max_step_rad):
 
 
 # ============================================================
-# DDS init (includes LIDAR subscriber)
+# DDS init
 # ============================================================
 
 
 def init_dds():
     from unitree_sdk2py.core.channel import ChannelFactoryInitialize
 
-    if len(sys.argv) > 1:
+    if len(sys.argv) > 1 and not sys.argv[1].startswith("-"):
         ChannelFactoryInitialize(0, sys.argv[1])
-        print("DDS interface:", sys.argv[1])
     else:
         ChannelFactoryInitialize(0)
-        print("DDS interface: default")
 
 
 def init_lidar_subscriber():
-    """Subscribe to LIDAR point cloud topic."""
     from unitree_sdk2py.core.channel import ChannelSubscriber
     from unitree_sdk2py.idl.sensor_msgs.msg.dds_ import PointCloud2_
 
@@ -791,8 +720,7 @@ def release_sport_and_highlevel():
 # ============================================================
 
 
-def run_lidar_calibration(scanner):
-    """Collect ground_z on flat ground for calibration."""
+def run_lidar_calibration(detector):
     global _lidar_cloud_msg, _lidar_cloud_count
 
     ground_zs = []
@@ -807,7 +735,6 @@ def run_lidar_calibration(scanner):
             try:
                 xyz = decode_xyz(_lidar_cloud_msg)
                 if len(xyz) > 100:
-                    # Quick ground_z measurement
                     bx = -xyz[:, 0]
                     by = xyz[:, 1]
                     bz = -xyz[:, 2]
@@ -816,47 +743,25 @@ def run_lidar_calibration(scanner):
                     y_ok = np.abs(by) <= Y_CAPTURE_HALF
                     gnd = y_ok & (bx >= -0.05) & (bx <= GROUND_X_MAX)
                     if np.sum(gnd) >= 10:
-                        # Simple z (no pitch correction needed on flat ground)
                         gz = float(np.median(bz[gnd]))
                         ground_zs.append(gz)
-            except:
+            except Exception:
                 pass
-
             pct = (time.time() - t0) / LIDAR_CALIB_DURATION * 100
             print(f"\r  {pct:5.1f}%  samples={len(ground_zs)}", end="", flush=True)
-
         time.sleep(0.02)
 
     print()
-    return scanner.calibrate_from_flat(ground_zs)
+    return detector.calibrate_from_flat(ground_zs)
 
 
 # ============================================================
-# IMU roll/pitch extraction for LIDAR
-# ============================================================
-
-
-def get_imu_rp_from_raw(raw):
-    """Extract roll and pitch in radians from raw state dict."""
-    quat = raw["imu"]["quat_wxyz"]
-    w, x, y, z = quat
-    sinr = 2.0 * (w * x + y * z)
-    cosr = 1.0 - 2.0 * (x * x + y * y)
-    roll = pymath.atan2(sinr, cosr)
-    sinp = max(-1.0, min(1.0, 2.0 * (w * y - z * x)))
-    pitch = pymath.asin(sinp)
-    return roll, pitch
-
-
-# ============================================================
-# robot_run: full deployment with LIDAR
+# robot_run: full deployment
 # ============================================================
 
 
 def run_robot_run(policy):
-    global _stair_scanner
-
-    import unitree_legged_const as go2
+    global _edge_detector
 
     from unitree_sdk2py.core.channel import ChannelPublisher
     from unitree_sdk2py.idl.default import unitree_go_msg_dds__LowCmd_
@@ -864,13 +769,13 @@ def run_robot_run(policy):
     from unitree_sdk2py.utils.crc import CRC
     from unitree_sdk2py.utils.thread import RecurrentThread
 
+    import unitree_legged_const as go2
+
     init_dds()
     latest = wait_for_lowstate()
 
-    # Start LIDAR subscriber
     lidar_sub = init_lidar_subscriber()
 
-    # Wait briefly for first cloud
     print("  Waiting for LIDAR data...", end="", flush=True)
     t0 = time.time()
     while _lidar_cloud_count == 0 and time.time() - t0 < 10.0:
@@ -879,15 +784,13 @@ def run_robot_run(policy):
     if _lidar_cloud_count > 0:
         print(f" OK ({_lidar_cloud_count} clouds)")
     else:
-        print("\n  [WARN] No LIDAR data — scan will be zeros (policy handles this)")
+        print("\n  [WARN] No LIDAR — edge detection will return defaults")
 
-    # Setup scanner
-    _stair_scanner = StairScanner()
-    loaded = _stair_scanner.load_calibration()
+    _edge_detector = EdgeDetector()
+    loaded = _edge_detector.load_calibration()
     if not loaded and _lidar_cloud_count > 0:
-        run_lidar_calibration(_stair_scanner)
+        run_lidar_calibration(_edge_detector)
 
-    # Release high-level
     release_sport_and_highlevel()
 
     # Publisher
@@ -951,12 +854,15 @@ def run_robot_run(policy):
         time.sleep(1.0 / POLICY_HZ)
     print("Stand pose reached.")
 
-    # Prompt
     print(
         f"\n*** ROBOT STANDING — LIDAR {'ACTIVE' if _lidar_cloud_count > 0 else 'INACTIVE'} ***"
     )
-    print(f"  Obs: {NUM_OBS} dims ({NUM_PROPRIO} proprio + {NUM_LIDAR_CELLS} LIDAR)")
-    print(f"  Stair: depth={STAIR_DEPTH}m height={STAIR_HEIGHT}m")
+    print(
+        f"  Obs: {NUM_OBS} dims ({NUM_PROPRIO} proprio + {NUM_STAIR_INFO} stair_info)"
+    )
+    print(
+        f"  Stair: height={STAIR_HEIGHT * 100:.1f}cm  depth={STAIR_DEPTH * 100:.1f}cm"
+    )
     print("Type 'go' to enable keyboard control.")
     user = input("> ").strip().lower()
     if user != "go":
@@ -965,7 +871,6 @@ def run_robot_run(policy):
 
     print_controls()
 
-    # State machine
     STATE_STANDING = "standing"
     STATE_POLICY = "policy"
     STATE_TRANSITION = "transition"
@@ -1007,7 +912,7 @@ def run_robot_run(policy):
 
                 if current_state == STATE_STANDING:
                     if is_movement or key == " ":
-                        print("\n→ POLICY mode (stair climbing + LIDAR)")
+                        print("\n→ POLICY mode (stair climbing)")
                         current_state = STATE_POLICY
                         shared["kp_per_joint"][:] = POLICY_KP_FALLBACK
                         shared["kd_per_joint"][:] = POLICY_KD_FALLBACK
@@ -1039,12 +944,17 @@ def run_robot_run(policy):
                     raw = lowstate_to_raw(latest["msg"])
                     command = make_command_list()
 
-                    # --- LIDAR scan update ---
+                    # Edge detection from LIDAR
                     roll_rad, pitch_rad = get_imu_rp_from_raw(raw)
-                    lidar_scan = update_lidar_scan(roll_rad, pitch_rad)
+                    edge_dist, direction = update_edge_detection(roll_rad, pitch_rad)
 
-                    # --- Build obs (49 + 15 = 64) ---
-                    obs = build_obs(raw, command, last_action_for_obs, lidar_scan)
+                    # Build stair info (4 scaled values)
+                    stair_info = build_stair_info(
+                        edge_dist, STAIR_HEIGHT, STAIR_DEPTH, direction
+                    )
+
+                    # Build obs (49 + 4 = 53)
+                    obs = build_obs(raw, command, last_action_for_obs, stair_info)
 
                     with torch.no_grad():
                         action_raw = policy.act_inference(obs.unsqueeze(0)).squeeze(0)
@@ -1079,7 +989,8 @@ def run_robot_run(policy):
                             step,
                             command,
                             target_q,
-                            lidar_scan_15=lidar_scan,
+                            edge_dist,
+                            direction,
                             kp_12=shared["kp_per_joint"] if PLS_ENABLE else None,
                             pitch_deg=pitch_deg,
                             roll_deg=roll_deg,
@@ -1093,14 +1004,12 @@ def run_robot_run(policy):
                     desired = slew_limit(prev_target_q, desired, MAX_STEP_RAD)
                     shared["target_q"] = desired.clone()
                     prev_target_q = desired.clone()
-
                     shared["kp_per_joint"] = (1 - alpha) * shared[
                         "kp_per_joint"
                     ] + alpha * torch.full((12,), STAND_KP)
                     shared["kd_per_joint"] = (1 - alpha) * shared[
                         "kd_per_joint"
                     ] + alpha * torch.full((12,), STAND_KD)
-
                     transition_step += 1
                     if transition_step >= transition_steps:
                         print("\n→ STAND ready")
@@ -1126,119 +1035,64 @@ def run_robot_run(policy):
 
 
 # ============================================================
-# robot_print mode
-# ============================================================
-
-
-def run_robot_print(policy):
-    global _stair_scanner
-
-    init_dds()
-    latest = wait_for_lowstate()
-    lidar_sub = init_lidar_subscriber()
-
-    _stair_scanner = StairScanner()
-    _stair_scanner.load_calibration()
-
-    dt = 1.0 / POLICY_HZ
-    step = 0
-    last_action = torch.zeros(NUM_ACT, dtype=torch.float32)
-
-    while True:
-        raw = lowstate_to_raw(latest["msg"])
-        command = make_command_list()
-
-        roll_rad, pitch_rad = get_imu_rp_from_raw(raw)
-        lidar_scan = update_lidar_scan(roll_rad, pitch_rad)
-
-        obs = build_obs(raw, command, last_action, lidar_scan)
-
-        with torch.no_grad():
-            action_raw = policy.act_inference(obs.unsqueeze(0)).squeeze(0)
-        action_clip = torch.clamp(action_raw, -ACTION_CLIP, ACTION_CLIP)
-
-        pos_action = action_clip[:NUM_POS_ACTIONS]
-        target_q = DEFAULT_DOF_POS + ACTION_SCALE * pos_action
-
-        kp_12, kd_12 = None, None
-        if PLS_ENABLE:
-            kp_12, kd_12 = compute_pls_kp_kd(action_clip[NUM_POS_ACTIONS:])
-
-        last_action = action_clip.clone()
-
-        if step % PRINT_EVERY_N == 0:
-            debug_print_all(
-                raw,
-                command,
-                last_action,
-                obs,
-                action_raw,
-                action_clip,
-                target_q,
-                lidar_scan_15=lidar_scan,
-                kp_12=kp_12,
-                kd_12=kd_12,
-                note=f"step {step}",
-            )
-        step += 1
-        time.sleep(dt)
-
-
-# ============================================================
 # MAIN
 # ============================================================
 
 
 def main():
     print(f"\n{'=' * 60}")
-    print("  Go2 STAIR CLIMBING + LIDAR Deployment")
-    print(f"  NUM_OBS:    {NUM_OBS} ({NUM_PROPRIO} proprio + {NUM_LIDAR_CELLS} LIDAR)")
-    print(f"  NUM_ACT:    {NUM_ACT}")
-    print(f"  PLS:        {'ON' if PLS_ENABLE else 'OFF'}")
-    print(f"  Stair:      depth={STAIR_DEPTH}m height={STAIR_HEIGHT}m")
-    print(f"  Edge range: 0 to {EDGE_SEARCH_MAX_X}m")
-    print(f"  Checkpoint: {CKPT_PATH}")
+    print("  Go2 STAIR CLIMBING — 4-Value Stair Info Deployment")
+    print(
+        f"  NUM_OBS:       {NUM_OBS} ({NUM_PROPRIO} proprio + {NUM_STAIR_INFO} stair_info)"
+    )
+    print(f"  NUM_ACT:       {NUM_ACT}")
+    print(f"  PLS:           {'ON' if PLS_ENABLE else 'OFF'}")
+    print(f"  Stair height:  {STAIR_HEIGHT * 100:.1f}cm")
+    print(f"  Stair depth:   {STAIR_DEPTH * 100:.1f}cm")
+    print(f"  Edge range:    0..{EDGE_MAX_RANGE * 100:.0f}cm")
+    print(f"  Checkpoint:    {CKPT_PATH}")
     print(f"{'=' * 60}\n")
 
     policy = load_policy(CKPT_PATH)
 
-    if MODE == "dummy":
-        with open(DUMMY_YAML_PATH, "r") as f:
-            raw = yaml.safe_load(f)
-        last_action = torch.zeros(NUM_ACT, dtype=torch.float32)
-        lidar_scan = np.zeros(NUM_LIDAR_CELLS, dtype=np.float32)
-        obs = build_obs(raw, make_command_list(), last_action, lidar_scan)
-        with torch.no_grad():
-            action_raw = policy.act_inference(obs.unsqueeze(0)).squeeze(0)
-        action_clip = torch.clamp(action_raw, -ACTION_CLIP, ACTION_CLIP)
-        target_q = DEFAULT_DOF_POS + ACTION_SCALE * action_clip[:NUM_POS_ACTIONS]
-        kp_12, kd_12 = None, None
-        if PLS_ENABLE:
-            kp_12, kd_12 = compute_pls_kp_kd(action_clip[NUM_POS_ACTIONS:])
-        debug_print_all(
-            raw,
-            make_command_list(),
-            last_action,
-            obs,
-            action_raw,
-            action_clip,
-            target_q,
-            lidar_scan_15=lidar_scan,
-            kp_12=kp_12,
-            kd_12=kd_12,
-            note="dummy",
-        )
-        return
-
-    if MODE == "robot_print":
-        run_robot_print(policy)
-        return
-
     if MODE == "robot_run":
         run_robot_run(policy)
-        return
+    elif MODE == "robot_print":
+        # Simplified print mode
+        global _edge_detector
+        init_dds()
+        latest = wait_for_lowstate()
+        init_lidar_subscriber()
+        _edge_detector = EdgeDetector()
+        _edge_detector.load_calibration()
 
-    print("Unknown MODE:", MODE)
+        last_action = torch.zeros(NUM_ACT, dtype=torch.float32)
+        step = 0
+        while True:
+            raw = lowstate_to_raw(latest["msg"])
+            roll_rad, pitch_rad = get_imu_rp_from_raw(raw)
+            edge_dist, direction = update_edge_detection(roll_rad, pitch_rad)
+            stair_info = build_stair_info(
+                edge_dist, STAIR_HEIGHT, STAIR_DEPTH, direction
+            )
+            obs = build_obs(raw, make_command_list(), last_action, stair_info)
+            with torch.no_grad():
+                action_raw = policy.act_inference(obs.unsqueeze(0)).squeeze(0)
+            action_clip = torch.clamp(action_raw, -ACTION_CLIP, ACTION_CLIP)
+            last_action = action_clip.clone()
+
+            if step % PRINT_EVERY_N == 0:
+                dir_sym = {1.0: "UP", -1.0: "DOWN"}.get(direction, "FLAT")
+                print(
+                    f"[step {step}] edge={edge_dist:.3f}m dir={dir_sym}  "
+                    f"stair_info={stair_info.tolist()}"
+                )
+            step += 1
+            time.sleep(1.0 / POLICY_HZ)
+    else:
+        print("Dummy mode — no robot needed")
+        stair_info = build_stair_info(EDGE_MAX_RANGE, STAIR_HEIGHT, STAIR_DEPTH, 0.0)
+        print(f"Stair info (flat ground): {stair_info.tolist()}")
 
 
 if __name__ == "__main__":

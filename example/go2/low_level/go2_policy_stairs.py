@@ -11,7 +11,9 @@ MODE = "robot_run"  # "dummy" | "robot_print" | "robot_run"
 
 DUMMY_YAML_PATH = "dummy_state.yaml"  ## to test off the robot
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-CKPT_PATH = os.path.join(SCRIPT_DIR, "stairs4_68000.pt")  # ← stair checkpoint
+CKPT_PATH = os.path.join(
+    SCRIPT_DIR, "stair_39cm_104000.pt"
+)  # ← stair checkpoint stable : stairs4_68000 for
 
 # ============================================================
 # PREDEFINED VELOCITIES
@@ -56,7 +58,7 @@ PLS_KP_RANGE = [10.0, 70.0]  # ← WIDER than walking [20,60] — stairs need mo
 #   - KD_FACTOR adjusts damping independently
 # ============================================================
 KP_FACTOR = 1.0
-KD_FACTOR = 0.6
+KD_FACTOR = 2.0
 
 # Fallback Kp/Kd for stand mode and transition (not from network)
 POLICY_KP_FALLBACK = 40.0
