@@ -11,17 +11,17 @@ MODE = "robot_run"  # "dummy" | "robot_print" | "robot_run"
 
 DUMMY_YAML_PATH = "dummy_state.yaml"  ## to test off the robot
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-CKPT_PATH = os.path.join(SCRIPT_DIR, "model_29000.pt")
+CKPT_PATH = os.path.join(SCRIPT_DIR, "model_69600.pt")
 
 # ============================================================
 # PREDEFINED VELOCITIES (edit these to change speed)
 # ============================================================
-FORWARD_VX = 0.4  # W key: forward speed
-BACKWARD_VX = 0.4  # S key: backward speed
-LEFT_VY = 0.5  # A key: negative vy (left)
-RIGHT_VY = 0.5  # D key: positive vy (right)w
-YAW_CW_WZ = 0.7  # Q key: clockwise yaw
-YAW_CCW_WZ = 0.7  # R key: counter-clockwise yaw
+FORWARD_VX = 0.0  # W key: forward speed
+BACKWARD_VX = 0.5  # S key: backward speed
+LEFT_VY = 1.0  # A key: negative vy (left)
+RIGHT_VY = 1.0  # D key: positive vy (right)
+YAW_CCW_WZ = 0.4  # Q key: counter-clockwise yaw
+YAW_CW_WZ = 0.4  # E key: clockwise yaw
 
 # ============================================================
 
@@ -36,33 +36,9 @@ STAND_SECONDS = 4.0
 STAND_KP = 40.0
 STAND_KD = 0.5
 
-# ============================================================
-# PLS (Per-Leg Stiffness) — deployment config
-# Must match training: go2_train_test7.py get_cfgs()
-# ============================================================
-PLS_ENABLE = True
-PLS_KP_DEFAULT = 40.0  # same as pls_kp_default in training
-PLS_KP_ACTION_SCALE = 20.0  # same as pls_kp_action_scale in training
-PLS_KP_RANGE = [20.0, 60.0]  # same as pls_kp_range in training
-
-# ============================================================
-# RUNTIME TUNING FACTORS
-# Multiply the network-computed Kp/Kd by these factors.
-# Useful for on-robot tuning without retraining.
-#   - Start at 1.0 (use network output as-is)
-#   - Increase KP_FACTOR if robot feels too soft / doesn't track well
-#   - Decrease KP_FACTOR if robot vibrates or is too stiff
-#   - KD_FACTOR adjusts damping independently of Kp
-#
-# Example: KP_FACTOR=0.8 means 80% of trained stiffness
-#          KD_FACTOR=1.2 means 20% more damping than formula
-# ============================================================
-KP_FACTOR = 1.0
-KD_FACTOR = 1.0
-
-# Fallback Kp/Kd for stand mode and transition (not from network)
-POLICY_KP_FALLBACK = 40.0  # used if PLS disabled or during stand
-POLICY_KD_FALLBACK = 2.0
+# Policy phase gains
+POLICY_KP = 60.0
+POLICY_KD = 3.0
 
 MAX_STEP_RAD = 0.1
 
@@ -73,17 +49,10 @@ SIMULATE_1STEP_ACTION_LATENCY = False
 # Transition timing
 TRANSITION_SECONDS = 2.0  # Time to transition back to stand
 
-# ============================================================
-# TRAINING CONSTANTS — must match training config exactly
-# ============================================================
+# TRAINING CONSTANTS
 
-NUM_POS_ACTIONS = 12
-NUM_STIFFNESS_ACTIONS = 4 if PLS_ENABLE else 0
-NUM_ACT = NUM_POS_ACTIONS + NUM_STIFFNESS_ACTIONS  # 16 with PLS, 12 without
-
-# Actor obs: ang_vel(3) + gravity(3) + commands(3) + dof_pos(12)
-#            + dof_vel(12) + actions(NUM_ACT)
-NUM_OBS = 3 + 3 + 3 + 12 + 12 + NUM_ACT  # 49 with PLS, 45 without
+NUM_OBS = 45
+NUM_ACT = 12
 
 OBS_SCALES = {"lin_vel": 2.0, "ang_vel": 0.25, "dof_pos": 1.0, "dof_vel": 0.05}
 
@@ -102,12 +71,6 @@ JOINT_NAMES = [
     "RL_calf",
 ]
 
-LEG_NAMES = ["FR", "FL", "RR", "RL"]
-
-# Leg-to-joint mapping: leg i controls joints [i*3, i*3+1, i*3+2]
-# FR: joints 0,1,2 | FL: joints 3,4,5 | RR: joints 6,7,8 | RL: joints 9,10,11
-LEG_JOINT_MAP = [[0, 1, 2], [3, 4, 5], [6, 7, 8], [9, 10, 11]]
-
 DEFAULT_DOF_POS = torch.tensor(
     [0.0, 0.8, -1.5, 0.0, 0.8, -1.5, 0.0, 1.0, -1.5, 0.0, 1.0, -1.5],
     dtype=torch.float32,
@@ -115,54 +78,7 @@ DEFAULT_DOF_POS = torch.tensor(
 STAND_DOF_POS = DEFAULT_DOF_POS.clone()
 
 
-# ============================================================
-# PLS: compute per-joint Kp/Kd from network stiffness actions
-# ============================================================
-
-
-def compute_pls_kp_kd(stiffness_actions_4):
-    """
-    Convert 4 stiffness actions (one per leg) to 12 per-joint Kp and Kd.
-
-    Matches training exactly:
-        kp_per_leg = PLS_KP_DEFAULT + action * PLS_KP_ACTION_SCALE
-        kp_per_leg = clamp(kp_per_leg, PLS_KP_RANGE)
-        kd_per_joint = 0.2 * sqrt(kp_per_joint)
-
-    Then applies runtime tuning factors:
-        final_kp = kp * KP_FACTOR
-        final_kd = kd * KD_FACTOR
-
-    Args:
-        stiffness_actions_4: tensor of shape (4,) — raw network output for stiffness
-
-    Returns:
-        kp_12: tensor (12,) per-joint Kp
-        kd_12: tensor (12,) per-joint Kd
-    """
-    # Per-leg Kp from network
-    kp_per_leg = PLS_KP_DEFAULT + stiffness_actions_4 * PLS_KP_ACTION_SCALE
-    kp_per_leg = torch.clamp(kp_per_leg, PLS_KP_RANGE[0], PLS_KP_RANGE[1])
-
-    # Expand to per-joint (each leg's Kp applies to its 3 joints)
-    kp_12 = torch.zeros(12, dtype=torch.float32)
-    for leg_idx in range(4):
-        for joint_idx in LEG_JOINT_MAP[leg_idx]:
-            kp_12[joint_idx] = kp_per_leg[leg_idx]
-
-    # Kd from formula: Kd = 0.2 * sqrt(Kp)  (Eq. 6 in paper)
-    kd_12 = 0.2 * torch.sqrt(kp_12)
-
-    # Apply runtime tuning factors
-    kp_12 = kp_12 * KP_FACTOR
-    kd_12 = kd_12 * KD_FACTOR
-
-    return kp_12, kd_12
-
-
-# ============================================================
 # Quaternion helpers (expects w,x,y,z)
-# ============================================================
 
 
 def quat_conj(q_wxyz):
@@ -196,19 +112,10 @@ def projected_gravity_from_quat_body_in_world(q_wxyz):
     return rotate_vec_by_quat(g_world, quat_conj(q))
 
 
-# ============================================================
-# Build the observation vector (NUM_OBS dims)
-# ============================================================
+# Build the 45-dim observation
 
 
-def build_obs(raw, command_3, last_action):
-    """
-    Build actor observation matching training env exactly.
-
-    last_action: tensor of shape (NUM_ACT,) — all 16 actions (12 pos + 4 stiffness)
-                 This is the FULL clipped action from the previous step, including
-                 stiffness outputs, because training puts all NUM_ACT actions in obs.
-    """
+def build_obs(raw, command_3, last_action_12):
     gyro = torch.tensor(raw["imu"]["gyro_rad_s"], dtype=torch.float32)
     proj_g = projected_gravity_from_quat_body_in_world(raw["imu"]["quat_wxyz"])
 
@@ -223,24 +130,22 @@ def build_obs(raw, command_3, last_action):
 
     obs = torch.cat(
         [
-            gyro * OBS_SCALES["ang_vel"],  # 3
-            proj_g,  # 3
-            cmd * cmd_scale,  # 3
-            (q - DEFAULT_DOF_POS) * OBS_SCALES["dof_pos"],  # 12
-            dq * OBS_SCALES["dof_vel"],  # 12
-            last_action,  # NUM_ACT (16 with PLS)
+            gyro * OBS_SCALES["ang_vel"],
+            proj_g,
+            cmd * cmd_scale,
+            (q - DEFAULT_DOF_POS) * OBS_SCALES["dof_pos"],
+            dq * OBS_SCALES["dof_vel"],
+            last_action_12,
         ],
         dim=0,
     )
 
     if obs.shape[0] != NUM_OBS:
-        raise RuntimeError(f"obs should be {NUM_OBS}, got {obs.shape[0]}")
+        raise RuntimeError(f"obs should be 45, got {obs.shape[0]}")
     return obs
 
 
-# ============================================================
 # Load policy checkpoint
-# ============================================================
 
 
 def load_policy(ckpt_path):
@@ -252,12 +157,9 @@ def load_policy(ckpt_path):
     except Exception:
         from rsl_rl.modules.actor_critic import ActorCritic
 
-    # Auto-detect critic obs size from checkpoint (privileged obs during training)
-    num_critic_obs = sd["critic.0.weight"].shape[1]
-
     policy = ActorCritic(
         num_actor_obs=NUM_OBS,
-        num_critic_obs=num_critic_obs,  # ← was NUM_OBS, now reads from checkpoint
+        num_critic_obs=NUM_OBS,
         num_actions=NUM_ACT,
         actor_hidden_dims=[512, 256, 128],
         critic_hidden_dims=[512, 256, 128],
@@ -266,27 +168,20 @@ def load_policy(ckpt_path):
     )
     policy.load_state_dict(sd, strict=True)
     policy.eval()
-    print(
-        f"  Loaded checkpoint: actor_obs={NUM_OBS}, critic_obs={num_critic_obs}, actions={NUM_ACT}"
-    )
     return policy
 
 
-# ============================================================
-# DEBUG PRINT — updated for PLS (16 actions)
-# ============================================================
+# DEBUG PRINT
 
 
 def debug_print_all(
     raw,
     command_3,
-    last_action,
-    obs,
-    action_raw,
-    action_clipped,
+    last_action_12,
+    obs_45,
+    action_raw_12,
+    action_clipped_12,
     target_q_12,
-    kp_12=None,
-    kd_12=None,
     note="",
 ):
     quat = raw["imu"]["quat_wxyz"]
@@ -311,84 +206,45 @@ def debug_print_all(
     for i, name in enumerate(JOINT_NAMES):
         print(f"  {i:02d} {name:>8s} : {dq[i]: .6f}")
 
-    print(f"\n==================== OBSERVATION VECTOR ({NUM_OBS}) =================")
+    print("\n==================== OBSERVATION VECTOR (45) =================")
     labels = []
     labels += ["ang_vel_x_scaled", "ang_vel_y_scaled", "ang_vel_z_scaled"]
     labels += ["grav_x", "grav_y", "grav_z"]
     labels += ["cmd_vx_scaled", "cmd_vy_scaled", "cmd_wz_scaled"]
     labels += [f"dof_pos_err_{n}_scaled" for n in JOINT_NAMES]
     labels += [f"dof_vel_{n}_scaled" for n in JOINT_NAMES]
-    labels += [f"last_act_pos_{n}" for n in JOINT_NAMES]
-    if PLS_ENABLE:
-        labels += [f"last_act_stiff_{leg}" for leg in LEG_NAMES]
+    labels += [f"last_action_{n}" for n in JOINT_NAMES]
 
-    for i in range(NUM_OBS):
-        print(f"{i:02d}  {labels[i]:>30s} : {float(obs[i]): .6f}")
+    for i in range(45):
+        print(f"{i:02d}  {labels[i]:>28s} : {float(obs_45[i]): .6f}")
 
-    print(
-        f"\n==================== ACTIONS ({NUM_ACT}) / ROBOT COMMAND ================="
-    )
-
-    # Position actions (first 12)
-    print("Position actions RAW (dimensionless):")
+    print("\n==================== ACTIONS / ROBOT COMMAND =================")
+    print("Policy action RAW (dimensionless):")
     for i, name in enumerate(JOINT_NAMES):
-        print(f"  {i:02d} {name:>8s} : {float(action_raw[i]): .6f}")
+        print(f"  {i:02d} {name:>8s} : {float(action_raw_12[i]): .6f}")
 
-    print("\nPosition actions CLIPPED (dimensionless):")
+    print("\nPolicy action CLIPPED (dimensionless):")
     for i, name in enumerate(JOINT_NAMES):
-        print(f"  {i:02d} {name:>8s} : {float(action_clipped[i]): .6f}")
-
-    # Stiffness actions (last 4) — only with PLS
-    if PLS_ENABLE and action_raw.shape[0] > 12:
-        print("\nStiffness actions RAW (dimensionless):")
-        for i, leg in enumerate(LEG_NAMES):
-            raw_val = float(action_raw[12 + i])
-            clip_val = float(action_clipped[12 + i])
-            kp_val = PLS_KP_DEFAULT + clip_val * PLS_KP_ACTION_SCALE
-            kp_val = max(PLS_KP_RANGE[0], min(PLS_KP_RANGE[1], kp_val))
-            print(
-                f"  {leg:>4s} : raw={raw_val: .4f}  clipped={clip_val: .4f}  → Kp_network={kp_val:.1f}"
-            )
+        print(f"  {i:02d} {name:>8s} : {float(action_clipped_12[i]): .6f}")
 
     print("\nTarget joint position q (rad):")
     for i, name in enumerate(JOINT_NAMES):
         print(f"  {i:02d} {name:>8s} : {float(target_q_12[i]): .6f}")
 
-    if kp_12 is not None and kd_12 is not None:
-        print(
-            f"\nPer-joint Kp/Kd (after KP_FACTOR={KP_FACTOR}, KD_FACTOR={KD_FACTOR}):"
-        )
-        for i, name in enumerate(JOINT_NAMES):
-            print(
-                f"  {i:02d} {name:>8s} : Kp={float(kp_12[i]):.2f}  Kd={float(kd_12[i]):.3f}"
-            )
-
-        print("\nPer-leg summary:")
-        for leg_idx, leg in enumerate(LEG_NAMES):
-            j = LEG_JOINT_MAP[leg_idx][0]  # first joint of leg
-            print(f"  {leg:>4s} : Kp={float(kp_12[j]):.2f}  Kd={float(kd_12[j]):.3f}")
-
 
 # Compact one-line status (used during policy loop instead of full debug dump)
-def print_status_line(step, command_3, target_q_12, kp_12=None):
+def print_status_line(step, command_3, target_q_12):
     vx, vy, wz = command_3
     tq = [float(target_q_12[i]) for i in range(12)]
-    kp_str = ""
-    if kp_12 is not None:
-        # Show per-leg Kp (first joint of each leg)
-        kps = [float(kp_12[LEG_JOINT_MAP[i][0]]) for i in range(4)]
-        kp_str = f"  Kp=[{kps[0]:.0f},{kps[1]:.0f},{kps[2]:.0f},{kps[3]:.0f}]"
     print(
         f"\r  step={step:06d}  cmd=[{vx:+.2f},{vy:+.2f},{wz:+.2f}]  "
-        f"tq0={tq[0]:+.3f} tq1={tq[1]:+.3f} tq2={tq[2]:+.3f}{kp_str}  ",
+        f"tq0={tq[0]:+.3f} tq1={tq[1]:+.3f} tq2={tq[2]:+.3f}  ",
         end="",
         flush=True,
     )
 
 
-# ============================================================
 # Robot lowstate -> raw dict
-# ============================================================
 
 
 def lowstate_to_raw(low_state):
@@ -483,7 +339,7 @@ def handle_key(key):
     ):  # Changed quit key to 'x' to avoid conflict with 's'
         return False
 
-    # WASD + Q/R controls
+    # WASD controls
     if key == "w":
         command_state["vx"] = FORWARD_VX
         command_state["vy"] = 0.0
@@ -503,13 +359,12 @@ def handle_key(key):
     elif key == "q":
         command_state["vx"] = 0.0
         command_state["vy"] = 0.0
-        command_state["wz"] = -YAW_CW_WZ
-    elif key == "r":
+        command_state["wz"] = YAW_CCW_WZ
+    elif key == "e":
         command_state["vx"] = 0.0
         command_state["vy"] = 0.0
-        command_state["wz"] = YAW_CCW_WZ
-    elif key == " ":
-        # Spacebar: zero velocity command (stays in policy mode)
+        command_state["wz"] = -YAW_CW_WZ
+    elif key == " " or key == "r":  # Space or 'r' for stop/reset
         command_state["vx"] = 0.0
         command_state["vy"] = 0.0
         command_state["wz"] = 0.0
@@ -523,10 +378,9 @@ def print_controls():
     print(f"  S           : backward  (vx={-BACKWARD_VX:.2f})")
     print(f"  D           : right     (vy={RIGHT_VY:.2f})")
     print(f"  A           : left      (vy={-LEFT_VY:.2f})")
-    print(f"  Q           : yaw CW    (wz={-YAW_CW_WZ:.2f})")
-    print(f"  R           : yaw CCW   (wz={YAW_CCW_WZ:.2f})")
-    print("  SPACE       : zero velocity (policy keeps running)")
-    print("  E           : return to stand")
+    print(f"  Q           : yaw CCW   (wz={YAW_CCW_WZ:.2f})")
+    print(f"  E           : yaw CW    (wz={-YAW_CW_WZ:.2f})")
+    print("  SPACE / R   : stop all (return to stand)")
     print("  X           : quit")
     print("==================================\n")
 
@@ -595,9 +449,7 @@ def release_sport_and_highlevel():
     print("High-level control released.")
 
 
-# ============================================================
-# robot_print — read-only mode, prints policy output
-# ============================================================
+# robot_print
 
 
 def run_robot_print(policy):
@@ -618,16 +470,7 @@ def run_robot_print(policy):
             action_raw = policy.act_inference(obs.unsqueeze(0)).squeeze(0)
 
         action_clip = torch.clamp(action_raw, -ACTION_CLIP, ACTION_CLIP)
-
-        # Split: position (12) + stiffness (4)
-        pos_action = action_clip[:NUM_POS_ACTIONS]
-        target_q = DEFAULT_DOF_POS + ACTION_SCALE * pos_action
-
-        # Compute Kp/Kd from network stiffness output
-        kp_12, kd_12 = None, None
-        if PLS_ENABLE and action_clip.shape[0] > NUM_POS_ACTIONS:
-            stiffness_action = action_clip[NUM_POS_ACTIONS:]
-            kp_12, kd_12 = compute_pls_kp_kd(stiffness_action)
+        target_q = DEFAULT_DOF_POS + ACTION_SCALE * action_clip
 
         last_action = action_clip.clone()
 
@@ -640,8 +483,6 @@ def run_robot_print(policy):
                 action_raw,
                 action_clip,
                 target_q,
-                kp_12=kp_12,
-                kd_12=kd_12,
                 note=f"robot_print step {step}",
             )
 
@@ -649,9 +490,8 @@ def run_robot_print(policy):
         time.sleep(dt)
 
 
-# ============================================================
-# robot_run: release -> stand -> prompt -> state machine
-# ============================================================
+# robot_run:
+# release -> go to stand -> prompt -> state machine (stand/policy/transition)
 
 
 def run_robot_run(policy):
@@ -690,11 +530,10 @@ def run_robot_run(policy):
         low_cmd.motor_cmd[i].tau = 0.0
 
     # shared command streamed at 500Hz
-    # With PLS, kp/kd are per-joint arrays instead of single scalars
     shared = {
         "target_q": None,
-        "kp_per_joint": torch.full((12,), STAND_KP, dtype=torch.float32),
-        "kd_per_joint": torch.full((12,), STAND_KD, dtype=torch.float32),
+        "kp": float(STAND_KP),
+        "kd": float(STAND_KD),
     }
 
     # start from current joints
@@ -702,19 +541,17 @@ def run_robot_run(policy):
     start_q = torch.tensor([m["q_rad"] for m in raw0["motors"]], dtype=torch.float32)
     shared["target_q"] = start_q.clone()
 
-    # 500Hz writer — now sends per-joint Kp/Kd
+    # 500Hz writer
     def write_lowcmd():
         tq = shared["target_q"]
         if tq is None:
             return
-        kp_arr = shared["kp_per_joint"]
-        kd_arr = shared["kd_per_joint"]
         for i in range(12):
             low_cmd.motor_cmd[i].mode = 0x01
             low_cmd.motor_cmd[i].q = float(tq[i])
             low_cmd.motor_cmd[i].dq = 0.0
-            low_cmd.motor_cmd[i].kp = float(kp_arr[i])
-            low_cmd.motor_cmd[i].kd = float(kd_arr[i])
+            low_cmd.motor_cmd[i].kp = float(shared["kp"])
+            low_cmd.motor_cmd[i].kd = float(shared["kd"])
             low_cmd.motor_cmd[i].tau = 0.0
         low_cmd.crc = crc.Crc(low_cmd)
         pub.Write(low_cmd)
@@ -742,8 +579,6 @@ def run_robot_run(policy):
 
     # 4) Prompt user to confirm before enabling control
     print("\n*** ROBOT IS STANDING - READY TO START ***")
-    print(f"PLS: {'ENABLED' if PLS_ENABLE else 'DISABLED'}")
-    print(f"Runtime tuning: KP_FACTOR={KP_FACTOR}, KD_FACTOR={KD_FACTOR}")
     print("Type 'go' and press Enter to enable keyboard control.")
     print("Anything else will abort.\n")
     user = input("> ").strip().lower()
@@ -753,7 +588,7 @@ def run_robot_run(policy):
 
     print_controls()
     print("\nRobot in STAND mode. Press movement keys to activate policy.")
-    print("Press 'E' to return to stand.\n")
+    print("Press 'SPACE' or 'R' to return to stand.\n")
 
     # State machine
     STATE_STANDING = "standing"
@@ -773,9 +608,6 @@ def run_robot_run(policy):
     transition_start_q = None
     transition_step = 0
     transition_steps = int(TRANSITION_SECONDS * POLICY_HZ)
-
-    # Keys that activate policy from standing
-    MOVEMENT_KEYS = ["w", "a", "s", "d", "q", "r"]
 
     running = True
     try:
@@ -802,24 +634,22 @@ def run_robot_run(policy):
                     running = False
                     break
 
-                # Check key types
-                is_movement_cmd = key in MOVEMENT_KEYS
-                is_stop_cmd = key == "e"  # E = return to stand
+                # Check if it's a movement command (WASD + QE)
+                is_movement_cmd = key in ["w", "a", "s", "d", "q", "e"]
+                is_stop_cmd = key in [" ", "r"]
 
                 # ===== STATE MACHINE =====
                 if current_state == STATE_STANDING:
-                    if is_movement_cmd or key == " ":
-                        # Any movement key OR spacebar activates policy
+                    if is_movement_cmd:
                         print("\n→ Activating POLICY mode")
                         current_state = STATE_POLICY
-                        # PLS: set initial Kp/Kd to fallback until first policy step
-                        shared["kp_per_joint"][:] = POLICY_KP_FALLBACK
-                        shared["kd_per_joint"][:] = POLICY_KD_FALLBACK
+                        shared["kp"] = float(POLICY_KP)
+                        shared["kd"] = float(POLICY_KD)
                         last_action_for_obs = torch.zeros(NUM_ACT, dtype=torch.float32)
                         prev_policy_action = torch.zeros(NUM_ACT, dtype=torch.float32)
                         prev_target_q = STAND_DOF_POS.clone()
                         step = 0
-                        # Process the key
+                        # Process the movement key
                         handle_key(key)
                     else:
                         # Stay in stand pose
@@ -841,7 +671,6 @@ def run_robot_run(policy):
                         continue
                     else:
                         # Normal policy execution
-                        # Spacebar sets zero velocity but keeps policy running
                         if not handle_key(key):
                             running = False
                             break
@@ -863,33 +692,17 @@ def run_robot_run(policy):
                         else:
                             exec_action = action_clip.clone()
 
-                        # Split: position (12) + stiffness (4)
-                        pos_action = exec_action[:NUM_POS_ACTIONS]
-                        policy_target_q = DEFAULT_DOF_POS + ACTION_SCALE * pos_action
+                        policy_target_q = DEFAULT_DOF_POS + ACTION_SCALE * exec_action
                         target_q = slew_limit(
                             prev_target_q, policy_target_q, MAX_STEP_RAD
                         )
                         prev_target_q = target_q.clone()
 
                         shared["target_q"] = target_q.clone()
-
-                        # Compute per-joint Kp/Kd from network stiffness output
-                        if PLS_ENABLE and exec_action.shape[0] > NUM_POS_ACTIONS:
-                            stiffness_action = exec_action[NUM_POS_ACTIONS:]
-                            kp_12, kd_12 = compute_pls_kp_kd(stiffness_action)
-                            shared["kp_per_joint"] = kp_12.clone()
-                            shared["kd_per_joint"] = kd_12.clone()
-
-                        # last_action includes ALL 16 dims (pos + stiffness)
                         last_action_for_obs = action_clip.clone()
 
                         if step % PRINT_EVERY_N == 0:
-                            print_status_line(
-                                step,
-                                command,
-                                target_q,
-                                kp_12=shared["kp_per_joint"] if PLS_ENABLE else None,
-                            )
+                            print_status_line(step, command, target_q)
 
                         step += 1
 
@@ -902,27 +715,19 @@ def run_robot_run(policy):
                     shared["target_q"] = desired.clone()
                     prev_target_q = desired.clone()
 
-                    # Ramp Kp/Kd back to stand values during transition
-                    shared["kp_per_joint"] = (1 - alpha) * shared[
-                        "kp_per_joint"
-                    ] + alpha * torch.full((12,), STAND_KP, dtype=torch.float32)
-                    shared["kd_per_joint"] = (1 - alpha) * shared[
-                        "kd_per_joint"
-                    ] + alpha * torch.full((12,), STAND_KD, dtype=torch.float32)
-
                     transition_step += 1
 
                     if transition_step >= transition_steps:
                         print("\n→ STAND mode ready")
                         current_state = STATE_STANDING
-                        shared["kp_per_joint"][:] = STAND_KP
-                        shared["kd_per_joint"][:] = STAND_KD
+                        shared["kp"] = float(STAND_KP)
+                        shared["kd"] = float(STAND_KD)
                         # Check if there's already a movement key pressed
-                        if key and key in MOVEMENT_KEYS:
+                        if key and key in ["w", "a", "s", "d", "q", "e"]:
                             print("→ Movement detected, activating POLICY mode")
                             current_state = STATE_POLICY
-                            shared["kp_per_joint"][:] = POLICY_KP_FALLBACK
-                            shared["kd_per_joint"][:] = POLICY_KD_FALLBACK
+                            shared["kp"] = float(POLICY_KP)
+                            shared["kd"] = float(POLICY_KD)
                             last_action_for_obs = torch.zeros(
                                 NUM_ACT, dtype=torch.float32
                             )
@@ -956,22 +761,6 @@ def run_robot_run(policy):
 
 
 def main():
-    print(f"\n{'=' * 50}")
-    print("  Go2 PLS Deployment")
-    print(f"  PLS:        {'ENABLED' if PLS_ENABLE else 'DISABLED'}")
-    print(
-        f"  NUM_ACT:    {NUM_ACT} ({'12 pos + 4 stiffness' if PLS_ENABLE else '12 pos'})"
-    )
-    print(f"  NUM_OBS:    {NUM_OBS}")
-    print(f"  KP_FACTOR:  {KP_FACTOR}")
-    print(f"  KD_FACTOR:  {KD_FACTOR}")
-    if PLS_ENABLE:
-        print(f"  Kp range:   {PLS_KP_RANGE}")
-        print(f"  Kp default: {PLS_KP_DEFAULT}")
-        print(f"  Kp scale:   {PLS_KP_ACTION_SCALE}")
-        print("  Kd formula: 0.2 * sqrt(Kp)")
-    print(f"{'=' * 50}\n")
-
     policy = load_policy(CKPT_PATH)
 
     if MODE == "dummy":
@@ -986,15 +775,7 @@ def main():
             action_raw = policy.act_inference(obs.unsqueeze(0)).squeeze(0)
 
         action_clip = torch.clamp(action_raw, -ACTION_CLIP, ACTION_CLIP)
-
-        # Split: position + stiffness
-        pos_action = action_clip[:NUM_POS_ACTIONS]
-        target_q = DEFAULT_DOF_POS + ACTION_SCALE * pos_action
-
-        kp_12, kd_12 = None, None
-        if PLS_ENABLE and action_clip.shape[0] > NUM_POS_ACTIONS:
-            stiffness_action = action_clip[NUM_POS_ACTIONS:]
-            kp_12, kd_12 = compute_pls_kp_kd(stiffness_action)
+        target_q = DEFAULT_DOF_POS + ACTION_SCALE * action_clip
 
         debug_print_all(
             raw,
@@ -1004,8 +785,6 @@ def main():
             action_raw,
             action_clip,
             target_q,
-            kp_12=kp_12,
-            kd_12=kd_12,
             note="dummy",
         )
         return

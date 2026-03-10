@@ -1,0 +1,25 @@
+# dummy_state.yaml
+# Units:
+# - imu.gyro_rad_s: rad/s
+# - imu.quat_wxyz: unit quaternion (w,x,y,z)
+# - motors[i].q_rad: rad
+# - motors[i].dq_rad_s: rad/s
+
+imu:
+  gyro_rad_s: [0.02, -0.01, 0.05]
+  quat_wxyz: [1.0, 0.0, 0.0, 0.0]   # upright
+
+motors:
+  # Order: FR(hip,thigh,calf), FL(hip,thigh,calf), RR(hip,thigh,calf), RL(hip,thigh,calf)
+  - {q_rad: 0.00, dq_rad_s: 0.0}
+  - {q_rad: 0.80, dq_rad_s: 0.0}
+  - {q_rad: -1.50, dq_rad_s: 0.0}
+  - {q_rad: 0.00, dq_rad_s: 0.0}
+  - {q_rad: 0.80, dq_rad_s: 0.0}
+  - {q_rad: -1.50, dq_rad_s: 0.0}
+  - {q_rad: 0.00, dq_rad_s: 0.0}
+  - {q_rad: 1.00, dq_rad_s: 0.0}
+  - {q_rad: -1.50, dq_rad_s: 0.0}
+  - {q_rad: 0.00, dq_rad_s: 0.0}
+  - {q_rad: 1.00, dq_rad_s: 0.0}
+  - {q_rad: -1.50, dq_rad_s: 0.0}

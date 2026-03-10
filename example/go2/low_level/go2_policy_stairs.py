@@ -58,7 +58,7 @@ PLS_KP_RANGE = [10.0, 70.0]  # ← WIDER than walking [20,60] — stairs need mo
 #   - KD_FACTOR adjusts damping independently
 # ============================================================
 KP_FACTOR = 1.0
-KD_FACTOR = 2.0
+KD_FACTOR = 1.0
 
 # Fallback Kp/Kd for stand mode and transition (not from network)
 POLICY_KP_FALLBACK = 40.0
