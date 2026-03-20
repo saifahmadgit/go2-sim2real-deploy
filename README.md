@@ -1,113 +1,214 @@
-# unitree_sdk2_python
-Python interface for unitree sdk2
+# Go2 Sim-to-Real Deploy
 
-# Installation
-## Dependencies
-- Python >= 3.8
-- cyclonedds == 0.10.2
-- numpy
-- opencv-python
+Hardware deployment for reinforcement learning locomotion policies on the Unitree Go2 quadruped. This repo covers the **deployment side** — loading trained checkpoints and running them on the real robot with keyboard control.
 
-### Installing from source
-Execute the following commands in the terminal:
+For simulation training, see the companion repo: [go2-sim2real-locomotion-rl](https://github.com/saifahmadgit/go2-sim2real-locomotion-rl)
+
+**Full write-up:** [Project Page](https://saifahmadgit.github.io/projects/quadruped-locomotion-rl/)
+
+[![Demo Video](https://img.youtube.com/vi/nrwN8KrsD2c/maxresdefault.jpg)](https://www.youtube.com/watch?v=nrwN8KrsD2c)
+▶ Click to watch on YouTube
+
+---
+
+## Policies
+
+| Policy | Script | Checkpoint | Description |
+|---|---|---|---|
+| Walk | `example/go2/low_level/final/go2_policy_walk.py` | `walk.pt` | Omnidirectional walking |
+| Stairs | `example/go2/low_level/final/go2_policy_stairs.py` | `stairs.pt` | Stair climbing (39 cm tread depth) |
+
+Both policies use **16 actions**: 12 joint position targets + 4 per-leg adaptive stiffness scalars. Observation space is 49-dimensional (IMU + joint encoders + last action — no privileged information at deployment).
+
+---
+
+## Setup
+
+### 1. Build CycloneDDS from source
+
+The SDK requires CycloneDDS 0.10.x. Pre-built packages often don't work — build from source:
+
 ```bash
 cd ~
-sudo apt install python3-pip
-git clone https://github.com/unitreerobotics/unitree_sdk2_python.git
-cd unitree_sdk2_python
-pip3 install -e .
-```
-## FAQ
-##### 1. Error when `pip3 install -e .`:
-```bash
-Could not locate cyclonedds. Try to set CYCLONEDDS_HOME or CMAKE_PREFIX_PATH
-```
-This error mentions that the cyclonedds path could not be found. First compile and install cyclonedds:
-
-```bash
-cd ~
-git clone https://github.com/eclipse-cyclonedds/cyclonedds -b releases/0.10.x 
+git clone https://github.com/eclipse-cyclonedds/cyclonedds -b releases/0.10.x
 cd cyclonedds && mkdir build install && cd build
 cmake .. -DCMAKE_INSTALL_PREFIX=../install
 cmake --build . --target install
 ```
-Enter the unitree_sdk2_python directory, set `CYCLONEDDS_HOME` to the path of the cyclonedds you just compiled, and then install unitree_sdk2_python.
+
+### 2. Clone and install this repo
+
 ```bash
-cd ~/unitree_sdk2_python
-export CYCLONEDDS_HOME="~/cyclonedds/install"
+cd ~
+git clone https://github.com/saifahmadgit/go2-sim2real-deploy.git
+cd go2-sim2real-deploy
+export CYCLONEDDS_HOME=~/cyclonedds/install
 pip3 install -e .
 ```
-For details, see: https://pypi.org/project/cyclonedds/#installing-with-pre-built-binaries
 
-# Usage
-The Python sdk2 interface maintains consistency with the unitree_sdk2 interface, achieving robot status acquisition and control through request-response or topic subscription/publishing. Example programs are located in the `/example` directory. Before running the examples, configure the robot's network connection as per the instructions in the document at https://support.unitree.com/home/en/developer/Quick_start.
-## DDS Communication
-In the terminal, execute:
+> **Note:** You need to `export CYCLONEDDS_HOME` before `pip install` so the build can find the CycloneDDS headers. You will also need to export it again in any new shell before running scripts (add it to your `~/.bashrc` to make it permanent).
+
+### 3. Install runtime dependencies
+
 ```bash
-python3 ./example/helloworld/publisher.py
+pip install torch                 # PyTorch — for policy inference
+pip install rsl-rl-lib==2.2.4     # ActorCritic architecture used for training
+pip install pynput                # Keyboard control at runtime
 ```
-Open a new terminal and execute:
+
+---
+
+## Network Setup
+
+The robot communicates over a wired Ethernet connection. You need to know which network interface on your machine is connected to the robot.
+
+Find your interface:
+
 ```bash
-python3 ./example/helloworld/subscriber.py
+ip link show
 ```
-You will see the data output in the terminal. The data structure transmitted between `publisher.py` and `subscriber.py` is defined in `user_data.py`, and users can define the required data structure as needed.
-## High-Level Status and Control
-The high-level interface maintains consistency with unitree_sdk2 in terms of data structure and control methods. For detailed information, refer to https://support.unitree.com/home/en/developer/sports_services.
-### High-Level Status
-Execute the following command in the terminal:
+
+Look for the interface that is `UP` and connected to the robot's subnet (typically `192.168.123.x`). Common names are `enp0s31f6`, `eth0`, `enp3s0` — this will differ per machine.
+
+You can verify the robot is reachable:
+
 ```bash
-python3 ./example/high_level/read_highstate.py enp2s0
+ping 192.168.123.161
 ```
-Replace `enp2s0` with the name of the network interface to which the robot is connected,.
-### High-Level Control
-Execute the following command in the terminal:
+
+Export the DDS environment variable in every shell you use:
+
 ```bash
-python3 ./example/high_level/sportmode_test.py enp2s0
+export CYCLONEDDS_HOME=~/cyclonedds/install
 ```
-Replace `enp2s0` with the name of the network interface to which the robot is connected. This example program provides several test methods, and you can choose the required tests as follows:
+
+---
+
+## Running Policies
+
+The deployment scripts automatically release the robot's high-level sport mode before taking low-level control — no manual step needed.
+
+### Walking
+
+```bash
+cd ~/go2-sim2real-deploy
+export CYCLONEDDS_HOME=~/cyclonedds/install
+python3 example/go2/low_level/final/go2_policy_walk.py enp0s31f6
+```
+
+Replace `enp0s31f6` with your network interface name.
+
+### Stair Climbing
+
+```bash
+python3 example/go2/low_level/final/go2_policy_stairs.py enp0s31f6
+```
+
+---
+
+## Keyboard Controls
+
+Once the script starts, the robot ramps to a standing pose over ~4 seconds, then prompts you to confirm before entering policy mode.
+
+| Key | Action |
+|---|---|
+| `W` | Forward |
+| `S` | Backward |
+| `A` | Strafe left |
+| `D` | Strafe right |
+| `Q` | Yaw clockwise |
+| `R` | Yaw counter-clockwise |
+| `Space` | Stop (zero velocity command) |
+| `E` | Return to stand pose |
+| `X` | Exit (safe stop — sends zero-torque packets) |
+
+---
+
+## Operating Modes
+
+Each script has a `MODE` variable near the top that controls behavior:
+
+| Mode | Description |
+|---|---|
+| `"robot_run"` | Live deployment — sends motor commands to the robot |
+| `"robot_print"` | Read-only — subscribes to lowstate and prints policy output, no commands sent |
+| `"dummy"` | Offline test — loads a sample state from `dummy_state.yaml`, no robot needed |
+
+Change the mode by editing the line at the top of the script:
+
 ```python
-test.StandUpDown() # Stand up and lie down
-# test.VelocityMove() # Velocity control
-# test.BalanceAttitude() # Attitude control
-# test.TrajectoryFollow() # Trajectory tracking
-# test.SpecialMotions() # Special motions
+MODE = "robot_run"  # "dummy" | "robot_print" | "robot_run"
 ```
-## Low-Level Status and Control
-The low-level interface maintains consistency with unitree_sdk2 in terms of data structure and control methods. For detailed information, refer to https://support.unitree.com/home/en/developer/Basic_services.
-### Low-Level Status
-Execute the following command in the terminal:
-```bash
-python3 ./example/low_level/lowlevel_control.py enp2s0
-```
-Replace `enp2s0` with the name of the network interface to which the robot is connected. The program will output the state of the right front leg hip joint, IMU, and battery voltage.
-### Low-Level Motor Control
-First, use the app to turn off the high-level motion service (sport_mode) to prevent conflicting instructions.
-Execute the following command in the terminal:
-```bash
-python3 ./example/low_level/lowlevel_control.py enp2s0
-```
-Replace `enp2s0` with the name of the network interface to which the robot is connected. The left hind leg hip joint will maintain a 0-degree position (for safety, set kp=10, kd=1), and the left hind leg calf joint will continuously output 1Nm of torque.
-## Wireless Controller Status
-Execute the following command in the terminal:
-```bash
-python3 ./example/wireless_controller/wireless_controller.py enp2s0
-```
-Replace `enp2s0` with the name of the network interface to which the robot is connected. The terminal will output the status of each key. For the definition and data structure of the remote control keys, refer to https://support.unitree.com/home/en/developer/Get_remote_control_status.
-## Front Camera
-Use OpenCV to obtain the front camera (ensure to run on a system with a graphical interface, and press ESC to exit the program):
-```bash
-python3 ./example/front_camera/camera_opencv.py enp2s0
-```
-Replace `enp2s0` with the name of the network interface to which the robot is connected.
 
-## Obstacle Avoidance Switch
-```bash
-python3 ./example/obstacles_avoid_switch/obstacles_avoid_switch.py enp2s0
-```
-Replace `enp2s0` with the name of the network interface to which the robot is connected. The robot will cycle obstacle avoidance on and off. For details on the obstacle avoidance service, see https://support.unitree.com/home/en/developer/ObstaclesAvoidClient
+Start with `"robot_print"` to verify DDS communication and policy output before running live.
 
-## Light and volume control
+---
+
+## High-Level Interface
+
+The `example/go2/high_level/` directory contains utilities for high-level sport mode control (stand, velocity commands, special motions). These are useful for diagnostics or manual testing:
+
 ```bash
-python3 ./example/vui_client/vui_client_example.py enp2s0
+python3 example/go2/high_level/go2_sport_client.py enp0s31f6
 ```
-Replace `enp2s0` with the name of the network interface to which the robot is connected.T he robot will cycle the volume and light brightness. The interface is detailed at https://support.unitree.com/home/en/developer/VuiClient
+
+Replace `enp0s31f6` with your interface name.
+
+---
+
+## System Architecture
+
+```
+Observation (49-dim, 50 Hz)
+  ├─ Angular velocity (3)         ← IMU gyroscope
+  ├─ Projected gravity (3)        ← from IMU quaternion
+  ├─ Velocity commands (3)        ← keyboard input
+  ├─ Joint position error (12)    ← encoders minus default pose
+  ├─ Joint velocity (12)          ← encoders
+  └─ Last action (16)             ← 12 pos + 4 stiffness
+
+Policy Network (ActorCritic MLP: 512 → 256 → 128)
+  └─ Output: 16 actions
+
+Action Processing
+  ├─ Clip to [−100, 100]
+  ├─ Position: scale × 0.25, add to default pose
+  ├─ Stiffness: 4 per-leg scalars → per-joint Kp/Kd
+  │    Kp = clamp(40 + action × 20, [20, 60])
+  │    Kd = 0.2 × √Kp
+  └─ Slew limit: max 0.1 rad/step
+
+LowCmd (500 Hz) → robot motors
+```
+
+---
+
+## Troubleshooting
+
+**`Could not locate cyclonedds`** during pip install:
+```bash
+export CYCLONEDDS_HOME=~/cyclonedds/install
+pip3 install -e .
+```
+
+**`ModuleNotFoundError: rsl_rl`**:
+```bash
+pip install rsl-rl-lib==2.2.4
+```
+
+**No DDS messages / script hangs at "Waiting for rt/lowstate..."**:
+- Verify the correct network interface is passed as the argument
+- Check the robot is powered on and the Ethernet cable is connected
+- Confirm `ping 192.168.123.161` succeeds
+
+**Robot does not respond to commands but script runs**:
+- Make sure sport mode was fully released — the script does this automatically, but if a previous session crashed mid-release, restart the robot and try again
+
+---
+
+## References
+
+- [Extreme Parkour with Legged Robots](https://arxiv.org/abs/2309.14341) — asymmetric actor-critic, privileged observations
+- [Variable Stiffness for Robust Locomotion through RL](https://arxiv.org/abs/2502.09436) — per-leg adaptive stiffness
+- [Unitree SDK2 Python](https://github.com/unitreerobotics/unitree_sdk2_python) — DDS communication layer
+- [Genesis Simulator](https://genesis-world.readthedocs.io/) — simulation environment used for training
