@@ -106,9 +106,19 @@ python3 example/go2/low_level/final/go2_policy_stairs.py enp0s31f6
 
 ---
 
-## Keyboard Controls
+## Startup Sequence
 
-Once the script starts, the robot ramps to a standing pose over ~4 seconds, then prompts you to confirm before entering policy mode.
+1. Script releases sport mode — the robot calls `StandDown()` and sits
+2. Rule-based ramp to standing pose over ~4 seconds (`STAND_SECONDS = 4.0`)
+3. Terminal prints `*** ROBOT IS STANDING - READY TO START ***`
+4. Type `go` and press Enter to hand control to the policy
+5. Press any movement key to start walking — the policy activates on the first command
+
+If you type anything other than `go` at step 4, the script aborts and holds the stand pose until you kill it.
+
+---
+
+## Keyboard Controls
 
 | Key | Action |
 |---|---|
@@ -153,6 +163,85 @@ python3 example/go2/high_level/go2_sport_client.py enp0s31f6
 ```
 
 Replace `enp0s31f6` with your interface name.
+
+---
+
+## Deployment Tuning
+
+All tunable parameters are defined as constants near the top of each script. Edit them before running — no retraining needed.
+
+### Velocity Commands
+
+These set the speed applied when you press each movement key:
+
+```python
+FORWARD_VX  = 0.4   # W key — forward speed (m/s)
+BACKWARD_VX = 0.4   # S key — backward speed (m/s)
+LEFT_VY     = 0.5   # A key — lateral speed (m/s)
+RIGHT_VY    = 0.5   # D key — lateral speed (m/s)
+YAW_CW_WZ   = 0.7   # Q key — yaw rate (rad/s)
+YAW_CCW_WZ  = 0.7   # R key — yaw rate (rad/s)
+```
+
+The stair policy was trained with forward velocity only (`lin_vel_x ∈ [0.3, 0.8]` m/s, no lateral or yaw). Keep `FORWARD_VX` in that range for stairs — lateral and yaw keys exist in the script but are outside the training distribution.
+
+---
+
+### Stiffness Tuning (KP\_FACTOR / KD\_FACTOR)
+
+The policy learns per-leg stiffness via the adaptive stiffness (PLS) mechanism — each leg's Kp and Kd are computed from the network output at runtime. The demo videos used no adjustment from the trained values (`KP_FACTOR = 1.0`, `KD_FACTOR = 1.0`).
+
+However, if your actuators respond differently (e.g. due to wear, temperature, or hardware variation), you can scale the network-computed gains without retraining:
+
+```python
+KP_FACTOR = 1.0   # Multiplies all per-joint Kp values
+KD_FACTOR = 1.0   # Multiplies all per-joint Kd values
+```
+
+**How to read the robot's response:**
+
+| Symptom | Adjustment |
+|---|---|
+| Joints feel floppy, poor position tracking | Increase `KP_FACTOR` (e.g. `1.1–1.2`) |
+| Joints vibrate or oscillate | Decrease `KP_FACTOR`, or increase `KD_FACTOR` |
+| Joints overshoot and bounce | Increase `KD_FACTOR` (e.g. `1.2–1.5`) |
+| Joints are sluggish / overdamped | Decrease `KD_FACTOR` |
+
+The underlying formula applied before these factors:
+```
+Kp_per_leg   = clamp(40.0 + action × 20.0,  [20, 60])   # Nm/rad
+Kd_per_joint = 0.2 × √Kp
+final_Kp     = Kp × KP_FACTOR
+final_Kd     = Kd × KD_FACTOR
+```
+
+Start at `1.0` and make small adjustments (±0.1 steps). The PLS mechanism already handles most stiffness variation across gait phases — these factors are a coarse global override for hardware-level differences only.
+
+> **Note:** `PLS_KP_DEFAULT`, `PLS_KP_ACTION_SCALE`, and `PLS_KP_RANGE` must match the training config exactly. Do not change these.
+
+---
+
+### Stand Phase Gains
+
+During the initial 4-second ramp to standing (before the policy runs), fixed gains are used:
+
+```python
+STAND_KP = 40.0   # Proportional gain during stand ramp
+STAND_KD = 0.5    # Derivative gain during stand ramp
+```
+
+---
+
+### Other Parameters
+
+```python
+STAND_SECONDS = 4.0    # Duration of stand ramp before policy starts
+MAX_STEP_RAD  = 0.1    # Max joint position change per control cycle (slew limit, rad)
+POLICY_HZ     = 50.0   # Policy inference rate (Hz)
+LOWCMD_HZ     = 500.0  # Motor command publish rate (Hz)
+```
+
+The policy runs at **50 Hz** and motor commands are sent at **500 Hz** — 10 interpolated command packets are sent per policy step. `MAX_STEP_RAD` caps how fast any joint can move per policy step regardless of network output, matching the training constraint.
 
 ---
 
